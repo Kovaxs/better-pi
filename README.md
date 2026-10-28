@@ -1,4 +1,4 @@
-# betterpi
+# better-pi
 
 Small, open-source tunings for [pi](https://pi.dev). Each one does one visible thing well.
 
@@ -13,7 +13,7 @@ Small, open-source tunings for [pi](https://pi.dev). Each one does one visible t
 Install every tuning:
 
 ```sh
-pi install git:github.com/<owner>/betterpi
+pi install git:github.com/kovaxs/better-pi
 ```
 
 Or load only the tunings you want with a package filter in your pi settings:
@@ -22,7 +22,7 @@ Or load only the tunings you want with a package filter in your pi settings:
 {
   "packages": [
     {
-      "source": "git:github.com/<owner>/betterpi",
+      "source": "git:github.com/kovaxs/better-pi",
       "extensions": ["tunings/sub-meter/index.ts"]
     }
   ]
