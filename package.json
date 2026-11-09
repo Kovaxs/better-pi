@@ -10,12 +10,14 @@
     "test": "node --test \"tunings/*/test/*.test.ts\""
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
   "pi": {
     "extensions": [
-      "tunings/sub-meter/index.ts"
+      "tunings/sub-meter/index.ts",
+      "tunings/speed-meter/index.ts"
     ]
   }
 }
