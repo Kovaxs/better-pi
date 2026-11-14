@@ -8,6 +8,7 @@ Small, open-source tunings for [pi](https://pi.dev). Each one does one visible t
 | -------------------------------------------- | -------------------------------------------------------------------- |
 | [`sub-meter`](tunings/sub-meter/README.md)     | Subscription usage windows and reset times above the prompt.         |
 | [`speed-meter`](tunings/speed-meter/README.md) | Task latency, TTFT, and median model generation speed in the footer. |
+| [`image-preview`](tunings/image-preview/README.md) | Hover image chips to preview; click to open in the system viewer. |
 
 ## Install
 
