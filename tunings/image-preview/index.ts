@@ -2,11 +2,16 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { convertToPng, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getCapabilities, truncateToWidth, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
-import { previewCard } from "./src/card.ts";
-import { branchImages, chipLayout, textSources, uniqueSources, viewerCommand, type ImageData, type PreviewSource } from "./src/images.ts";
+import { convertToPng, CustomEditor, resizeImage, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getCapabilities, stripTerminalSequences, truncateToWidth, visibleWidth, type OverlayHandle, type TUI } from "@earendil-works/pi-tui";
+import { previewCard, type PreviewImage } from "./src/card.ts";
+import { branchImages, chipLayout, textSources, uniqueSources, viewerCommand, type PreviewSource } from "./src/images.ts";
 import { loadImage } from "./src/load.ts";
+import { imageEditor } from "./src/editor.ts";
+import { ImageMarkers } from "./src/markers.ts";
+import { enableHoverMotion } from "./src/mouse.ts";
+import { decodePng } from "./src/pixels.ts";
+import { isTmux, isWezTerm } from "./src/protocol.ts";
 
 export default function imagePreview(pi: ExtensionAPI) {
 	let ctx: ExtensionContext | undefined;
@@ -24,20 +29,50 @@ export default function imagePreview(pi: ExtensionAPI) {
 	let target: { x: number; y: number; width: number } | undefined;
 	let tempDir: string | undefined;
 	let opening = false;
+	let markers: ImageMarkers | undefined;
+	let editorText: (() => string) | undefined;
+	let restoreEditor: (() => void) | undefined;
+	let restoreMotion: (() => void) | undefined;
+	let wezterm = false;
+	let passthrough = false;
+
+	pi.registerFlag("image-preview-terminal", {
+		description: "Image preview terminal: auto or wezterm (use when tmux hides terminal identification)",
+		type: "string",
+		default: "auto",
+	});
 
 	function closeHover() {
 		hoverGeneration++;
+		const wasVisible = overlay !== undefined;
 		overlay?.hide();
 		overlay = undefined;
+		if (wasVisible && wezterm) tui?.requestRender(true);
 		hovered = undefined;
 		target = undefined;
 	}
 
-	async function prepare(source: PreviewSource): Promise<ImageData> {
-		const image = await loadImage(source);
-		if (getCapabilities().images === "kitty" && image.mimeType !== "image/png") {
+	async function prepare(source: PreviewSource): Promise<PreviewImage> {
+		let image = await loadImage(source);
+		if (wezterm) {
+			// Leave headroom for OSC/DCS framing under tmux\u0027s default 1 MiB input buffer.
+			if (passthrough && image.data.length > 900_000) {
+				const resized = await resizeImage(Buffer.from(image.data, "base64"), image.mimeType, {
+					maxWidth: 4096, maxHeight: 4096, maxBytes: 650_000, jpegQuality: 95,
+				});
+				if (!resized) throw new Error("Image is too large for tmux preview; open the original instead");
+				image = { type: "image", data: resized.data, mimeType: resized.mimeType };
+			}
+			return { ...image, wezterm: { tmux: passthrough } };
+		}
+		const protocol = getCapabilities().images;
+		if ((protocol === "kitty" || !protocol) && image.mimeType !== "image/png") {
 			const converted = await convertToPng(image.data, image.mimeType);
-			return converted ? { type: "image", ...converted } : image;
+			if (converted) image = { type: "image", ...converted };
+		}
+		if (!protocol && image.mimeType === "image/png") {
+			try { return { ...image, pixels: decodePng(Buffer.from(image.data, "base64")) }; }
+			catch { /* Unusual encodings retain the metadata/system-viewer fallback. */ }
 		}
 		return image;
 	}
@@ -90,13 +125,14 @@ export default function imagePreview(pi: ExtensionAPI) {
 		try {
 			const image = await prepare(source);
 			if (token !== hoverGeneration || ctx !== current || !tui) return;
-			const height = Math.min(18, y);
+			const height = Math.min(wezterm ? 30 : 18, y);
+			const columns = Math.min(wezterm ? 120 : 76, tui.terminal.columns);
 			if (height < 4) return;
 			const card = previewCard(image, source.label, current.ui.theme, height);
 			overlay = tui.showOverlay(card, {
 				nonCapturing: true,
-				row: Math.max(0, y - card.render(Math.min(76, tui.terminal.columns)).length),
-				col: 0, width: Math.min(76, tui.terminal.columns), maxHeight: height,
+				row: Math.max(0, y - card.render(columns).length),
+				col: 0, width: columns, maxHeight: height,
 			});
 		} catch {
 			// Missing or unsupported files remain available through the command, which reports errors.
@@ -117,7 +153,7 @@ export default function imagePreview(pi: ExtensionAPI) {
 			let chips: ReturnType<typeof chipLayout>["chips"] = [];
 			return {
 				render(width) {
-					const layout = chipLayout(sources.length, width, prefix);
+					const layout = chipLayout(sources.length, width, prefix, draft.length ? sources.map((source, i) => markers?.numberForPath(source.key) ?? i + 1) : undefined);
 					chips = layout.chips;
 					const hint = host.mode === "fullscreen" ? " · hover to preview · click to open" : " · /image-preview";
 					return [truncateToWidth(theme.fg("accent", layout.text) + theme.fg("dim", hint), width)];
@@ -151,13 +187,19 @@ export default function imagePreview(pi: ExtensionAPI) {
 		lastText = text;
 		closeHover();
 		const token = ++generation;
-		const candidates = textSources(text, current.cwd).slice(0, 24);
+		const candidates = uniqueSources([
+			...(markers?.sourcesIn(editorText?.() ?? "") ?? []),
+			...textSources(text, current.cwd),
+		]).slice(0, 24);
 		const results = await Promise.all(candidates.map(async (source) => {
 			try { return "path" in source && (await stat(source.path)).isFile() ? source : undefined; }
 			catch { return undefined; }
 		}));
 		if (token !== generation || ctx !== current) return;
 		draft = results.filter((source) => source !== undefined);
+		for (const source of draft) {
+			if ("path" in source && markers?.numberForPath(source.path) === undefined) markers?.collapse(source.path);
+		}
 		updateWidget();
 	}
 
@@ -168,14 +210,43 @@ export default function imagePreview(pi: ExtensionAPI) {
 		updateWidget();
 	}
 
-	pi.on("session_start", (_event, current) => {
+	pi.on("session_start", async (_event, current) => {
 		if (current.mode !== "tui") return;
 		ctx = current;
-		// A widget factory supplies the host TUI without replacing the editor or footer.
-		current.ui.setWidget("image-preview", (host) => {
-			tui = host;
-			return { render: () => [], invalidate() {} };
-		});
+		wezterm = isWezTerm(process.env, String(pi.getFlag("image-preview-terminal")));
+		passthrough = wezterm && isTmux(process.env);
+		if (passthrough) {
+			try {
+				const result = await pi.exec("tmux", ["show-option", "-gv", "allow-passthrough"], { timeout: 3000, maxBuffer: 1024 });
+				if (result.code !== 0 || !["on", "all"].includes(result.stdout.trim())) {
+					wezterm = false;
+					current.ui.notify("Image preview: enable sharp images in tmux with: set -g allow-passthrough on", "warning");
+				}
+			} catch { wezterm = false; }
+		}
+		markers = new ImageMarkers(current.cwd);
+		const registry = markers;
+		const previous = current.ui.getEditorComponent();
+		const factory: NonNullable<typeof previous> = (host, theme, keys) => {
+			if (tui !== host) {
+				restoreMotion?.();
+				tui = host;
+				restoreMotion = enableHoverMotion(host);
+			}
+			const base = previous?.(host, theme, keys) ?? new CustomEditor(host, theme, keys);
+			editorText = () => base.getText();
+			return imageEditor(base, registry, {
+				hover: (source, x, y, width) => { void hover(source, x, y, width); },
+				open: (source) => { void openViewer(source); },
+				leave: closeHover,
+				plain: stripTerminalSequences,
+				measure: visibleWidth,
+			});
+		};
+		current.ui.setEditorComponent(factory);
+		restoreEditor = () => {
+			if (current.ui.getEditorComponent() === factory) current.ui.setEditorComponent(previous);
+		};
 		rebuild(current);
 		unsubscribe = current.ui.onTerminalInput((data) => {
 			const mouse = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
@@ -227,6 +298,7 @@ export default function imagePreview(pi: ExtensionAPI) {
 					},
 				};
 			}, { overlay: true, overlayOptions: { width: "90%", maxHeight: "90%" } });
+			if (wezterm) tui?.requestRender(true);
 			if (action === "open") await openViewer(source);
 		} catch (error) {
 			current.ui.notify(`Image preview: ${error instanceof Error ? error.message : String(error)}`, "warning");
@@ -243,6 +315,11 @@ export default function imagePreview(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		restoreMotion?.();
+		restoreMotion = undefined;
+		restoreEditor?.();
+		restoreEditor = undefined;
+		editorText = undefined;
 		ctx = undefined;
 		generation++;
 		if (timer) clearInterval(timer);

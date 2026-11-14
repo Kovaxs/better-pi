@@ -7,6 +7,7 @@ test("finds pasted, quoted, escaped, @, relative, and home image paths", () => {
 		["/tmp/a.png", "/work/b.JPG", "/tmp/screen shot.webp", "/tmp/other shot.png", "/home/me/c.gif"]);
 	assert.deepEqual(imagePaths("@'/tmp/a b.png' @\"/tmp/c d.png\" ./one.png\n./two.png", "/work"),
 		["/tmp/a b.png", "/tmp/c d.png", "/work/one.png", "/work/two.png"]);
+	assert.deepEqual(imagePaths("look /tmp/unquoted screen shot.png and /tmp/second.jpg", "/work"), ["/tmp/unquoted screen shot.png", "/tmp/second.jpg"]);
 });
 
 test("ignores remote images, unsupported formats and deduplicates paths", () => {
